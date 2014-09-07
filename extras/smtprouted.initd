@@ -1,0 +1,88 @@
+#!/bin/bash
+#
+# smtprouted   A SMTP routing daemon
+#
+# chkconfig: 2345 80 30
+#
+# processname: /usr/sbin/smtprouted
+# config: /etc/smtprouted.conf
+# pidfile: /var/run/smtprouted.pid
+#
+
+
+PATH=/sbin:/bin:/usr/bin:/usr/sbin
+prog="smtprouted"
+
+# Source function library.
+. /etc/init.d/functions
+
+if [ "$1" = "status" ] ; then
+	status $prog
+	RETVAL=$?
+	exit $RETVAL
+fi
+
+RETVAL=0
+
+start(){
+	test -x /usr/sbin/smtprouted  || exit 5
+
+	echo -n $"Starting $prog: "
+
+	daemon $prog 
+	RETVAL=$?
+	echo
+	if test $RETVAL = 0 ; then
+		touch /var/lock/subsys/smtprouted
+	fi
+	return $RETVAL
+}
+
+stop(){
+	echo -n $"Stopping $prog: "
+	killproc $prog
+	RETVAL=$?
+	echo
+	rm -f /var/lock/subsys/smtprouted
+	return $RETVAL
+}
+
+reload(){
+	stop
+	start
+}
+
+restart(){
+	stop
+	start
+}
+
+condrestart(){
+	[ -e /var/lock/subsys/smtprouted ] && restart
+	return 0
+}
+
+
+case "$1" in
+    start)
+	start
+	;;
+    stop)
+	stop
+	;;
+    restart)
+	restart
+	;;
+    reload|force-reload)
+	reload
+	;;
+    condrestart|try-restart)
+	condrestart
+	;;
+    *)
+	echo $"Usage: $0 {start|stop|status|restart|condrestart|try-restart|reload|force-reload}"
+	RETVAL=3
+esac
+
+exit $RETVAL
+

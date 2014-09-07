@@ -1,0 +1,486 @@
+#!/usr/bin/python
+
+# smtprouted - Eric Schwimmer (eric@nerdvana.org)
+#
+# A very performant python script for selectively forwarding email to
+# different endpoints based on regular expression matching.  It also
+# provides address rewriting functionality, as well as message de-duplication
+# (i.e. it will only forward a message to the first MAIL TO: recipient that it
+# receives, regardless of how many addresses are on the recipient list).  This
+# script is perhaps most useful when acting as the frontend for a
+# catchall/mailsink mail server used for testing email sending routines.
+#
+# Licensed via the MIT License (http://opensource.org/licenses/MIT)
+
+
+__version__ = "0.1"
+
+import socket, Queue, signal, sys, re, argparse
+import datetime, ConfigParser, logging, os, smtplib
+from multiprocessing.pool import ThreadPool
+
+# Read in the command line and file based configuration parameters
+def readConfig(): ##########################################################
+
+    # Build our config parser
+    parser = argparse.ArgumentParser(
+        description="SMTP message proxy/router")
+    parser.add_argument("-c", "--config-file", default="/etc/smtprouted.conf",
+        help="Path to the smtpRouter config file")
+    parser.add_argument("-d", "--debug", action="store_true",
+        help="Emit debug output")
+    parser.add_argument("-f", "--foreground", action="store_true",
+        help="Don't daemonize; run program in the foreground")
+
+    # Parse command line
+    global cfg
+    cfg = parser.parse_args()
+
+    # Open our config file
+    cfgParser = ConfigParser.RawConfigParser()
+    if not cfgParser.read(cfg.config_file):
+        cfg.defaults = True
+    else:
+        cfg.defaults = False
+
+    # Read in all of our global / default options
+    cfg.pidFile = cfgStr(cfgParser, 'global', 'pidFile', '/var/run/smtprouted')
+    cfg.logFile = cfgStr(cfgParser, 'global', 'logFile', '/var/log/smtprouted')
+
+    cfg.maxWorkers  = cfgInt(cfgParser, 'global', 'maxWorkers', 50)
+    cfg.smtpTimeout = cfgInt(cfgParser, 'global', 'smtpTimeout', 5)
+    cfg.bindAddr    = cfgAddr(cfgParser, 'global', 'bindAddr', 'localhost')
+    cfg.bindPort    = cfgInt(cfgParser,  'global', 'bindPort', 25)
+    cfg.defaultAddr = cfgAddr(cfgParser, 'global', 'defaultAddr', 'localhost')
+    cfg.defaultPort = cfgInt(cfgParser,  'global', 'defaultPort', 2525)
+    cfg.dedupeMail  = cfgBool(cfgParser, 'global', 'dedupeMail', False)
+    cfg.rewriteExpr = cfgReSub(cfgParser, 'global', 'rewriteExpr', [])
+
+    # Our hostname
+    cfg.fqdn        = socket.getfqdn()
+
+    # Now parse each custom route config section
+    cfg.customRoutes = []
+    for section in cfgParser.sections():
+        if section == 'global':
+            continue
+
+        cfg.customRoutes.append(
+            [
+                cfgRe(cfgParser, section, 'toExpr'),
+                cfgAddr(cfgParser, section, 'routeAddr'),
+                cfgInt(cfgParser, section, 'routePort', 25),
+                cfgBool(cfgParser, section, 'dedupeMail', False),
+                cfgReSub(cfgParser, section, 'rewriteExpr', [])
+            ]
+        )
+
+    cfg.numCustom = len(cfg.customRoutes)
+
+# Grab a regex rewrite string from our config
+def cfgReSub(cfg, section, name, default=None): #############################
+    try:
+        blob = cfg.get(section, name)
+    except ConfigParser.Error:
+        if default is not None:
+            return default
+        fatal("Missing required config parameter %s:%s." % (section, name))
+
+    if not '/' in blob:
+        fatal("format must be 'from/to' at %s:%s" % (section,name))
+
+    # Build our regular expression and test it
+    fromTxt,toTxt = blob.split('/',1)
+    try:
+        fromExpr = re.compile(fromTxt, flags=re.I)
+    except:
+        fatal("'from' expr '%s' malformed at %s:%s" % (fromTxt,section,name))
+
+    try:
+        fromExpr.sub(toTxt, 'test@test.com')
+    except error as e:
+        fatal("'to' expr '%s' malformed at %s:%s" % (toTxt,section,name))
+
+
+    return [fromExpr, toTxt]
+
+# Grab an string from our config
+def cfgStr(cfg, section, name, default=None): ################################
+    try:
+        return cfg.get(section, name)
+    except ConfigParser.Error:
+        if default is not None:
+            return default
+        fatal("Missing required config parameter %s:%s." % (section, name))
+
+# Grab an string from our config and try to compile it as a regular expression
+def cfgRe(cfg, section, name, default=None): #################################
+    try:
+        return re.compile(cfg.get(section, name))
+    except re.error:
+        fatal("Invalid regex in config parameter %s:%s," % (section, name))
+    except ConfigParser.Error:
+        if default is not None:
+            return default
+        fatal("Missing required config parameter %s:%s." % (section, name))
+
+# Grab an int from our config, complain if it isn't valid
+def cfgInt(cfg, section, name, default=None): ################################
+    try:
+        return cfg.getint(section, name)
+    except ValueError:
+        fatal("Config parameter %s:%s must be an integer." % (section, name))
+    except ConfigParser.Error:
+        if default is not None:
+            return default
+        fatal("Missing required config parameter %s:%s." % (section, name))
+
+# Grab an int from our config, complain if it isn't valid
+def cfgBool(cfg, section, name, default=None): ###############################
+    try:
+        return cfg.getboolean(section, name)
+    except ValueError:
+        fatal("Config parameter %s:%s must be an boolean." % (section, name))
+    except ConfigParser.Error:
+        if default is not None:
+            return default
+        fatal("Missing required config parameter %s:%s." % (section, name))
+
+# Grab an network address from our config, complain if it isn't valid
+def cfgAddr(cfg, section, name, default=None): ###############################
+    # Fetch and validate a hostname/ip address config option
+    try:
+        addr = cfg.get(section, name)
+        socket.gethostbyname(addr)
+        return addr
+    except ConfigParser.Error:
+        if default is not None:
+            return default
+        fatal("Missing required config parameter %s:%s." % (section, name))
+    except socket.gaierror:
+        fatal("Invalid address for config parameter %s:%s" % (section, name))
+
+# This is our worker thread that will actually receive the incoming
+# connections, attempt to do something approaching an SMTP-compliant
+# message transaction with the client, and then fire the received
+# message off the processMessage() function
+def smtpWorker(connQueue): ###################################################
+
+    # Accept connections by reading from the blocking connection
+    # queue
+    while True:
+
+        conn = connQueue.get()
+
+        fh          = conn.makefile()
+        remoteName  = mailFrom = inData = False
+        toRcpts     = []
+        data        = ""
+
+        send(conn, "220 %s ESMTP smtpRouter" % cfg.fqdn)
+
+        # Enter our read loop
+        while True:
+            try:
+                line = fh.readline()
+            except socket.error, err:
+                break
+
+            # If we are in the "DATA" portion of the transaction,
+            # append all incoming text to the data blob
+            if inData:
+
+                # If we are in data mode and got our terminator string, try
+                # and send the message
+                if line == ".\r\n":
+                    routeMsg(mailFrom,toRcpts,data)
+
+                    # Clear things up, in case the client tries to re-use the
+                    # current connection to send another message
+                    send(conn,"250 Ok")
+                    toRcpts = []
+                    mailFrom = False
+                    data = ""
+                    inData = False
+                else:
+                    data += line
+
+            else:
+                # Otherwise parse our incoming commands
+                try:
+                    cmd = line.split()[0].upper()
+                except:
+                    send(conn,'500 Error: bad syntax')
+                    continue
+
+                # Handle all of our possible SMTP commands
+                if cmd in ("HELO", "EHLO"):
+                    if remoteName:
+                        send(conn,"503 Duplicate HELO/EHLO")
+                        continue
+                    remoteName = line[5:]
+                    if not remoteName:
+                        send(conn,"501 Syntax: HELO hostname")
+                        continue
+                    send(conn,"250 %s" % cfg.fqdn)
+                elif cmd == "MAIL":
+                    if mailFrom:
+                        send(conn,"503 Error: nested MAIL command")
+                        continue
+                    mailFrom = getaddr(line[10:])
+                    if not mailFrom:
+                        send(conn,"501 Syntax: MAIL FROM:<address>")
+                    send(conn,"250 Ok")
+                elif cmd == "RCPT":
+                    if not mailFrom:
+                        send(conn,"503 Error: need MAIL command")
+                        continue
+                    toAddr = getaddr(line[8:])
+                    if not toAddr:
+                        send(conn,"501 Syntax: RCPT TO:<address>")
+                        continue
+                    toRcpts.append(toAddr)
+                    send(conn,"250 Ok")
+                elif cmd == "DATA":
+                    if not toAddr:
+                        send(conn,"503 Error: need RCPT command before DATA")
+                        continue
+                    if ' ' in line:
+                        send(conn,"501 Syntax: DATA")
+                    send(conn,"354 End data with <CR><LF>.<CR><LF>")
+                    inData = True
+                elif cmd == "QUIT":
+                    send(conn,"221 Bye")
+                    break
+                elif cmd == "NOOP":
+                    send(conn,"250 Ok")
+                    continue
+                elif cmd == "RSET":
+                    mailFrom = False
+                    toRcpts = []
+                    data = ""
+                    send(conn,"250 Ok")
+                    continue
+                else:
+                    send(conn,"502 Error: command not recognized")
+
+        # Shut things down once we are done with this connection
+        logger.debug("Disconnect from %s:%s" % conn.getpeername())
+        try:
+            conn.close()
+        except socket.error, err:
+            pass
+
+# Extract our address from our MAIL/RCPT smtp commands
+def getaddr(str): ############################################################
+    addr = str.strip()
+    if addr[0] == "<" and addr[-1] == ">" and addr != "<>":
+        return addr[1:-1]
+    return addr
+
+# Send a message out to our SMTP client, with graceful failure
+def send(conn, msg): #########################################################
+    try:
+        conn.send(msg + "\r\n")
+    except socket.error, err:
+        pass
+
+# Parse message data and forward it to the appropriate endpoint
+def routeMsg(mailFrom,toRcpts,data): #########################################
+
+    routeList = range(cfg.numCustom+1)
+    rcpts   = [ [] for i in routeList ]
+    routes  = cfg.customRoutes
+
+    # Add the default route to the end of our routing list
+    routes.append([None, cfg.defaultAddr, cfg.defaultPort,
+        cfg.dedupeMail, cfg.rewriteExpr])
+
+    # Iterate over all of the addresses and partition them according to
+    # our routing rules, using the user-provided regexes rules
+    for addr in toRcpts:
+        customMatch = None
+        # If an address matches a custom route expression, add it to
+        # the recipient list for that route
+        for i in routeList[:-1]:
+            customMatch = routes[i][0].search(addr)
+            if customMatch:
+                rcpts[i].append(addr)
+                break
+        # Otherwise add it to the recipient list for the default route
+        if not customMatch:
+            rcpts[-1].append(addr)
+
+    # Now send our messages on their way
+    for i in routeList:
+        if not rcpts[i]:
+            continue
+
+        addr,port,dedupe,rewrite = routes[i][1:]
+
+        if dedupe:
+            rcpts[i] = [rcpts[i][0],]
+            statMsg = "deduped message"
+        else:
+            statMsg = "message"
+
+        if rewrite:
+            # Since we can't really test the replacement side of a regex
+            # sub without having data that matches the search string
+            # (which is pretty difficult to generate on a per-regex basis)
+            # we just have to wrap this in a try block
+            try:
+                rcpts[i] = map(
+                    lambda x: rewrite[0].sub(rewrite[1], x),
+                    rcpts[i])
+            except re.error as e:
+                logger.error("Failed to perform rewrite to '%s': %s" %
+                    (rewrite[1], e))
+                
+
+        logger.debug("Sending %s to %s via %s:%s" %
+            (statMsg, ','.join(rcpts[i]), addr, port))
+        try:
+            smtpObj = smtplib.SMTP(addr, port, cfg.smtpTimeout)
+            smtpObj.sendmail(mailFrom, rcpts[i], data)
+        except smtplib.SMTPException as e:
+            logger.warning('Error sending to %s:%s (%s)' % (addr, port, e))
+
+
+# Set up the logger module
+def loggerSetup(): ###########################################################
+
+    # Log configuration
+
+    #et our maximum severity level to log (i.e. debug or not)
+    logLevel = logging.DEBUG if cfg.debug else logging.INFO
+    if cfg.foreground:
+        logFh = sys.stdout
+    else:
+        try:
+            logFh = open(cfg.logFile, 'a')
+        except IOError as e:
+            fatal("Unable to log to %s (%S)" % (cfg.logFile, e.strerror))
+
+    logging.basicConfig(
+        stream=logFh,
+        level=logLevel,
+        format="%(asctime)s %(levelname)s: %(message)s",
+        datefmt="[%Y-%m-%d@%H:%M:%S]"
+    )
+
+    global logger
+    logger = logging.getLogger("smtpRouter")
+
+    # Make the logger emit all unhandled exceptions
+    sys.excepthook = lambda t, v, x: logger.exception(str(v))
+
+    if cfg.defaults:
+        logger.info("Can't read config file %s; using default values" %
+            cfg.config_file)
+
+# Throw a fatal message and exit
+def fatal(msg): ##############################################################
+
+    try:
+        logger
+    # If our logger isnt defined, print directly to stdout
+    except:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d@%H:%M:%S")
+        print "[%s] CRITICAL: %s" % (ts, msg)
+    # Otherwise, just use the logger
+    else:
+        logger.critical(msg)
+
+    sys.exit(1)
+
+# Launch our process as a daemon
+def daemonize(): #############################################################
+
+    UMASK = 0
+    MAXFD = 1024
+
+    # Fork once
+    try:
+        pid = os.fork()
+    except OSError, e:
+        fatal("Unable to fork: %s [%d]" % (e.strerror, e.errno))
+
+    # In the first child process
+    if (pid == 0):
+        os.setsid()
+
+        try:
+            pid = os.fork()
+        except OSError, e:
+            fatal("Unable to fork: %s [%d]" % (e.strerror, e.errno))
+
+        if (pid == 0):
+            os.chdir("/")
+            os.umask(UMASK)
+        else:
+            os._exit(0)
+    else:
+        os._exit(0)
+
+    # Close all open file descriptors
+    for fd in range(0, MAXFD):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    # DUP our stdout & stderr filehandles to dev null
+    os.open(os.devnull, os.O_RDWR)
+    os.dup2(0, 1)
+    os.dup2(0, 2)
+
+    return
+
+# Our main loop
+def main(): ##################################################################
+
+    # Read command line parameters and config file
+    readConfig()
+
+    # Daemonize, unless requested otherwise
+    if not cfg.foreground:
+        daemonize()
+
+    # Catch sigints
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit())
+
+    # Start our logger
+    loggerSetup()
+
+    # Drop our pid file
+    if not cfg.foreground:
+        with open(cfg.pidFile, 'w') as fh:
+            fh.write(str(os.getpid()))
+
+    # Set up our connection queue; used for multiplexing connections
+    connQueue = Queue.Queue()
+
+    # Start our thread pool
+    workerPool = ThreadPool(processes=cfg.maxWorkers, initializer=smtpWorker,
+        initargs=[connQueue])
+
+    # Start our listener socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((cfg.bindAddr, cfg.bindPort))
+        sock.listen(1)
+    except socket.error as e:
+        fatal("Unable to bind to %s:%s (%s)" % (cfg.bindAddr, cfg.bindPort, e))
+
+    logger.info("Daemon started")
+
+    while True:
+        conn, addr = sock.accept()
+        logger.debug("Connect from %s:%s" % addr)
+        connQueue.put(conn)
+
+
+if __name__ == "__main__":
+    main()
